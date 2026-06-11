@@ -1,7 +1,4 @@
-/**
- * ShopEasy - Main Server Entry Point
- * Initializes Express app, middleware, routes, and DB connection
- */
+
 
 require("dotenv").config();
 require("express-async-errors"); // Handles async errors without try/catch
