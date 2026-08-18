@@ -1,8 +1,3 @@
-/**
- * User Model
- * Handles user authentication, roles, and profile data
- */
-
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -66,22 +61,23 @@ const userSchema = new mongoose.Schema(
   }
 );
 
-// ─── Pre-save Hook: Hash Password ─────────────────────────────────────────────
+// Hashing lives on the model, so no controller can accidentally save a plain
+// password. The isModified guard matters: without it, updating a profile would
+// hash the already-hashed password and lock the user out.
 userSchema.pre("save", async function (next) {
-  // Only hash if password is modified (not on other updates)
   if (!this.isModified("password")) return next();
 
-  const salt = await bcrypt.genSalt(12); // Cost factor of 12 for security
+  const salt = await bcrypt.genSalt(12);
   this.password = await bcrypt.hash(this.password, salt);
   next();
 });
 
-// ─── Instance Method: Compare Password ───────────────────────────────────────
 userSchema.methods.comparePassword = async function (candidatePassword) {
   return await bcrypt.compare(candidatePassword, this.password);
 };
 
-// ─── Instance Method: Generate JWT ───────────────────────────────────────────
+// The payload is readable by anyone holding the token, so it carries only what
+// the API needs to identify the caller - never anything secret.
 userSchema.methods.generateAuthToken = function () {
   return jwt.sign(
     {
@@ -94,7 +90,8 @@ userSchema.methods.generateAuthToken = function () {
   );
 };
 
-// ─── Virtual: Full Profile (no password) ─────────────────────────────────────
+// What the client is allowed to see. Everything the API returns about a user
+// goes through here.
 userSchema.methods.toPublicJSON = function () {
   return {
     _id: this._id,

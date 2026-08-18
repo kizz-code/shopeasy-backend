@@ -1,34 +1,25 @@
-/**
- * API Response Utility
- * Standardizes all API responses with consistent structure
- */
+// Every endpoint answers with the same shape, so the frontend never has to guess
+// how to read a response.
 
-/**
- * successResponse - Standard success response
- */
 const successResponse = (res, message, data = null, statusCode = 200) => {
-  const response = { success: true, message };
-  if (data !== null) response.data = data;
-  return res.status(statusCode).json(response);
+  const body = { success: true, message };
+  if (data !== null) body.data = data;
+  return res.status(statusCode).json(body);
 };
 
-/**
- * paginatedResponse - Response with pagination metadata
- */
-const paginatedResponse = (res, message, data, pagination) => {
-  return res.status(200).json({
+const paginatedResponse = (res, message, data, { page, totalPages, totalItems, limit }) =>
+  res.status(200).json({
     success: true,
     message,
     data,
     pagination: {
-      currentPage: pagination.page,
-      totalPages: pagination.totalPages,
-      totalItems: pagination.totalItems,
-      itemsPerPage: pagination.limit,
-      hasNextPage: pagination.page < pagination.totalPages,
-      hasPrevPage: pagination.page > 1,
+      currentPage: page,
+      totalPages,
+      totalItems,
+      itemsPerPage: limit,
+      hasNextPage: page < totalPages,
+      hasPrevPage: page > 1,
     },
   });
-};
 
 module.exports = { successResponse, paginatedResponse };

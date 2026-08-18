@@ -1,12 +1,13 @@
 /**
- * Payment Controller
- * Razorpay payment gateway integration
+ * Razorpay payment flow (optional - cash on delivery works without any of this):
  *
- * Flow:
- * 1. Frontend calls /create-order → Backend creates Razorpay order → Returns order_id
- * 2. Frontend opens Razorpay checkout UI with order_id
- * 3. User completes payment → Razorpay returns payment_id + signature
- * 4. Frontend calls /verify → Backend verifies HMAC signature → Marks order as paid
+ * 1. Frontend calls /create-order      -> we create a Razorpay order and return its id
+ * 2. Frontend opens the Razorpay popup with that id
+ * 3. Razorpay hands back a payment id and a signature
+ * 4. Frontend calls /verify            -> we recompute the signature and confirm the order
+ *
+ * Step 4 is the important one: the browser is not trusted to tell us a payment
+ * succeeded. We recompute the HMAC with our secret key and only believe it if it matches.
  */
 
 const Razorpay = require("razorpay");
@@ -15,45 +16,68 @@ const Order = require("../models/Order");
 const { createError } = require("../utils/apiError");
 const { successResponse } = require("../utils/apiResponse");
 
-// Initialize Razorpay instance
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+const KEY_ID = process.env.RAZORPAY_KEY_ID;
+const KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+
+// The repo ships with placeholder keys so the project runs out of the box. Until
+// real keys are set we keep online payment switched off rather than failing
+// halfway through a checkout.
+const isConfigured = Boolean(
+  KEY_ID && KEY_SECRET && !KEY_ID.startsWith("your_") && !KEY_SECRET.startsWith("your_")
+);
+
+const razorpay = isConfigured
+  ? new Razorpay({ key_id: KEY_ID, key_secret: KEY_SECRET })
+  : null;
+
+const requireConfigured = (next) => {
+  if (isConfigured) return false;
+  next(createError("Online payment is not configured on this server. Please use cash on delivery.", 503));
+  return true;
+};
+
+// Loads an order and refuses it if it belongs to somebody else.
+const findOwnedOrder = async (orderId, user) => {
+  const order = await Order.findById(orderId);
+  if (!order) throw createError("Order not found.", 404);
+  if (order.user.toString() !== user._id.toString()) {
+    throw createError("Access denied.", 403);
+  }
+  return order;
+};
 
 /**
- * @desc    Create Razorpay order for payment
- * @route   POST /api/payment/create-order
- * @access  Private
+ * GET /api/payment/config
+ * Lets the checkout page know whether to offer online payment at all.
  */
-const createRazorpayOrder = async (req, res, next) => {
-  const { orderId } = req.body;
-
-  // Fetch our order from DB
-  const order = await Order.findById(orderId);
-  if (!order) return next(createError("Order not found.", 404));
-
-  if (order.user.toString() !== req.user._id.toString()) {
-    return next(createError("Access denied.", 403));
-  }
-
-  if (order.payment.status === "completed") {
-    return next(createError("This order has already been paid.", 400));
-  }
-
-  // Create Razorpay order
-  // Amount must be in paise (INR × 100)
-  const razorpayOrder = await razorpay.orders.create({
-    amount: Math.round(order.pricing.grandTotal * 100), // Convert to paise
-    currency: "INR",
-    receipt: order.orderNumber,
-    notes: {
-      orderId: order._id.toString(),
-      userId: req.user._id.toString(),
-    },
+const getPaymentConfig = (req, res) =>
+  successResponse(res, "Payment config", {
+    onlinePaymentEnabled: isConfigured,
+    keyId: isConfigured ? KEY_ID : null,
   });
 
-  // Save Razorpay order ID to our order
+/**
+ * POST /api/payment/create-order
+ */
+const createRazorpayOrder = async (req, res, next) => {
+  if (requireConfigured(next)) return;
+
+  const order = await findOwnedOrder(req.body.orderId, req.user);
+
+  if (order.payment.status === "completed") {
+    return next(createError("This order has already been paid for.", 409));
+  }
+  if (order.status === "cancelled") {
+    return next(createError("This order was cancelled and cannot be paid for.", 400));
+  }
+
+  const razorpayOrder = await razorpay.orders.create({
+    amount: Math.round(order.pricing.grandTotal * 100), // Razorpay works in paise
+    currency: "INR",
+    receipt: order.orderNumber,
+    notes: { orderId: order._id.toString() },
+  });
+
   order.payment.razorpay_order_id = razorpayOrder.id;
   await order.save({ validateBeforeSave: false });
 
@@ -61,55 +85,49 @@ const createRazorpayOrder = async (req, res, next) => {
     razorpayOrderId: razorpayOrder.id,
     amount: razorpayOrder.amount,
     currency: razorpayOrder.currency,
-    keyId: process.env.RAZORPAY_KEY_ID,
+    keyId: KEY_ID,
     orderNumber: order.orderNumber,
   });
 };
 
 /**
- * @desc    Verify payment signature and confirm order
- * @route   POST /api/payment/verify
- * @access  Private
- *
- * Security: HMAC-SHA256 signature verification prevents payment tampering
- * The signature is: HMAC_SHA256(razorpay_order_id + "|" + razorpay_payment_id, key_secret)
+ * POST /api/payment/verify
  */
 const verifyPayment = async (req, res, next) => {
+  if (requireConfigured(next)) return;
+
   const { razorpay_order_id, razorpay_payment_id, razorpay_signature, orderId } = req.body;
 
-  // ─── HMAC Signature Verification ─────────────────────────────────────────
-  const body = razorpay_order_id + "|" + razorpay_payment_id;
+  const order = await findOwnedOrder(orderId, req.user);
+
+  // The signature is tied to the Razorpay order we created for THIS order. Checking
+  // it stops someone replaying a valid payment from a different, cheaper order.
+  if (order.payment.razorpay_order_id !== razorpay_order_id) {
+    return next(createError("This payment does not belong to the given order.", 400));
+  }
 
   const expectedSignature = crypto
-    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-    .update(body)
+    .createHmac("sha256", KEY_SECRET)
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
     .digest("hex");
 
   if (expectedSignature !== razorpay_signature) {
-    // Signature mismatch = payment tampered or invalid
     return next(createError("Payment verification failed. Invalid signature.", 400));
   }
 
-  // ─── Update Order ─────────────────────────────────────────────────────────
-  const order = await Order.findById(orderId);
-  if (!order) return next(createError("Order not found.", 404));
-
-  order.payment = {
-    razorpay_order_id,
-    razorpay_payment_id,
-    razorpay_signature,
-    status: "completed",
-    paidAt: new Date(),
-  };
+  order.payment.razorpay_payment_id = razorpay_payment_id;
+  order.payment.razorpay_signature = razorpay_signature;
+  order.payment.status = "completed";
+  order.payment.paidAt = new Date();
   order.status = "confirmed";
   order.statusHistory.push({
     status: "confirmed",
-    note: `Payment completed. Payment ID: ${razorpay_payment_id}`,
+    note: `Payment received (${razorpay_payment_id})`,
   });
 
   await order.save();
 
-  return successResponse(res, "Payment verified successfully! Your order is confirmed.", {
+  return successResponse(res, "Payment verified. Your order is confirmed!", {
     order: {
       _id: order._id,
       orderNumber: order.orderNumber,
@@ -120,29 +138,30 @@ const verifyPayment = async (req, res, next) => {
 };
 
 /**
- * @desc    Handle payment failure (log it)
- * @route   POST /api/payment/failure
- * @access  Private
+ * POST /api/payment/failure
+ * Records that an attempt did not go through so the user can retry from order history.
  */
 const handlePaymentFailure = async (req, res, next) => {
-  const { orderId, razorpay_order_id, error } = req.body;
+  const order = await findOwnedOrder(req.body.orderId, req.user);
 
-  const order = await Order.findById(orderId);
-  if (!order) return next(createError("Order not found.", 404));
-
-  order.payment.razorpay_order_id = razorpay_order_id;
   order.payment.status = "failed";
   order.statusHistory.push({
-    status: "pending",
-    note: `Payment failed: ${error?.description || "Unknown error"}`,
+    status: order.status,
+    note: `Payment attempt failed: ${req.body.error?.description || "cancelled by user"}`,
   });
 
   await order.save({ validateBeforeSave: false });
 
-  return successResponse(res, "Payment failure logged. You can retry payment.", {
+  return successResponse(res, "Payment attempt recorded. You can try again.", {
     orderId: order._id,
     orderNumber: order.orderNumber,
   });
 };
 
-module.exports = { createRazorpayOrder, verifyPayment, handlePaymentFailure };
+module.exports = {
+  getPaymentConfig,
+  createRazorpayOrder,
+  verifyPayment,
+  handlePaymentFailure,
+  isOnlinePaymentEnabled: () => isConfigured,
+};

@@ -1,119 +1,154 @@
-/**
- * Order Controller
- * Place orders, track history, and run analytics via aggregation pipelines
- */
-
 const Order = require("../models/Order");
 const Cart = require("../models/Cart");
 const Product = require("../models/Product");
 const { createError } = require("../utils/apiError");
 const { successResponse, paginatedResponse } = require("../utils/apiResponse");
+const { calculatePricing } = require("../utils/pricing");
+const { isOnlinePaymentEnabled } = require("./paymentController");
+
+// A customer can only back out while the order has not shipped.
+const CANCELLABLE = ["pending", "confirmed"];
+
+// Where an admin is allowed to move an order next.
+const NEXT_STATUS = {
+  pending: ["confirmed", "cancelled"],
+  confirmed: ["shipped", "cancelled"],
+  shipped: ["delivered"],
+  delivered: [],
+  cancelled: [],
+};
+
+// Gives back stock that was already taken when a later item in the same order fails.
+const restoreStock = (items) =>
+  Promise.all(
+    items.map((i) => Product.updateOne({ _id: i.product }, { $inc: { stock: i.quantity } }))
+  );
 
 /**
- * @desc    Place a new order
- * @route   POST /api/orders
- * @access  Private
+ * POST /api/orders
+ * Turns the user's cart into an order.
  */
 const placeOrder = async (req, res, next) => {
-  const { shippingAddress, paymentMethod = "razorpay", notes } = req.body;
+  const { shippingAddress, paymentMethod = "cod", notes } = req.body;
 
-  // Get user's cart
-  const cart = await Cart.findOne({ user: req.user._id });
-  if (!cart || cart.items.length === 0) {
+  if (paymentMethod === "razorpay" && !isOnlinePaymentEnabled()) {
+    return next(createError("Online payment is not available. Please choose cash on delivery.", 400));
+  }
+
+  // Claim the cart in one atomic step: we read the items and empty it in the same
+  // operation. If the user double-clicks "Place order", only the first request gets
+  // items back - the second finds an empty cart and is rejected. That is our
+  // duplicate-order protection, and it needs no extra bookkeeping.
+  const claimedCart = await Cart.findOneAndUpdate(
+    { user: req.user._id, "items.0": { $exists: true } },
+    { $set: { items: [] } }
+  );
+
+  if (!claimedCart) {
     return next(createError("Your cart is empty. Add items before placing an order.", 400));
   }
 
-  // Validate stock for all items simultaneously
-  const stockChecks = await Promise.all(
-    cart.items.map(async (item) => {
-      const product = await Product.findById(item.product);
-      if (!product || !product.isActive) {
-        return { valid: false, message: `Product "${item.name}" is no longer available.` };
+  const cartItems = claimedCart.items;
+  const takenStock = [];
+
+  try {
+    const orderItems = [];
+
+    // One product at a time, so we know exactly what to give back if something fails.
+    for (const item of cartItems) {
+      // The filter does the stock check and the decrement in a single atomic update,
+      // so two people buying the last unit cannot both succeed.
+      const product = await Product.findOneAndUpdate(
+        { _id: item.product, isActive: true, stock: { $gte: item.quantity } },
+        { $inc: { stock: -item.quantity } },
+        { new: true }
+      );
+
+      if (!product) {
+        const current = await Product.findById(item.product).select("name stock isActive");
+        throw createError(
+          !current || !current.isActive
+            ? `"${item.name}" is no longer available.`
+            : `Only ${current.stock} left of "${current.name}". Please update your cart.`,
+          409
+        );
       }
-      if (product.stock < item.quantity) {
-        return {
-          valid: false,
-          message: `Insufficient stock for "${item.name}". Available: ${product.stock}`,
-        };
-      }
-      return { valid: true, product, item };
-    })
-  );
 
-  const invalidItem = stockChecks.find((check) => !check.valid);
-  if (invalidItem) return next(createError(invalidItem.message, 400));
+      takenStock.push({ product: product._id, quantity: item.quantity });
 
-  // Calculate pricing
-  const itemsTotal = cart.totalPrice;
-  const shippingCharge = itemsTotal > 500 ? 0 : 49; // Free shipping above ₹500
-  const taxAmount = Math.round(itemsTotal * 0.18); // 18% GST
-  const grandTotal = itemsTotal + shippingCharge + taxAmount;
+      // Price comes from the product, not from the cart snapshot, so a stale or
+      // tampered cart cannot change what the customer is charged.
+      const price = product.discountedPrice > 0 ? product.discountedPrice : product.price;
 
-  // Build order items from cart
-  const orderItems = cart.items.map((item) => ({
-    product: item.product,
-    name: item.name,
-    image: item.image,
-    price: item.price,
-    quantity: item.quantity,
-  }));
+      orderItems.push({
+        product: product._id,
+        name: product.name,
+        image: item.image,
+        price,
+        quantity: item.quantity,
+      });
+    }
 
-  // Create the order
-  const order = await Order.create({
-    user: req.user._id,
-    items: orderItems,
-    shippingAddress,
-    paymentMethod,
-    pricing: { itemsTotal, shippingCharge, taxAmount, discount: 0, grandTotal },
-    notes,
-    statusHistory: [{ status: "pending", note: "Order placed successfully" }],
-  });
+    const itemsTotal = orderItems.reduce((sum, i) => sum + i.price * i.quantity, 0);
+    const pricing = calculatePricing(itemsTotal);
 
-  // Deduct stock for each product
-  await Promise.all(
-    stockChecks.map(({ product, item }) =>
-      Product.findByIdAndUpdate(product._id, { $inc: { stock: -item.quantity } })
-    )
-  );
+    // Cash on delivery has nothing to pay online, so it is confirmed straight away.
+    const isCod = paymentMethod === "cod";
 
-  // Clear the cart after successful order
-  await Cart.findOneAndUpdate({ user: req.user._id }, { items: [] });
+    const order = await Order.create({
+      user: req.user._id,
+      items: orderItems,
+      shippingAddress,
+      paymentMethod,
+      pricing,
+      notes,
+      status: isCod ? "confirmed" : "pending",
+      statusHistory: [
+        { status: "pending", note: "Order placed" },
+        ...(isCod ? [{ status: "confirmed", note: "Cash on delivery selected" }] : []),
+      ],
+    });
 
-  return successResponse(
-    res,
-    "Order placed successfully! Complete payment to confirm.",
-    { order: { _id: order._id, orderNumber: order.orderNumber, grandTotal, status: order.status } },
-    201
-  );
+    return successResponse(
+      res,
+      isCod ? "Order placed successfully!" : "Order created. Complete payment to confirm.",
+      {
+        order: {
+          _id: order._id,
+          orderNumber: order.orderNumber,
+          status: order.status,
+          paymentMethod: order.paymentMethod,
+          pricing: order.pricing,
+        },
+      },
+      201
+    );
+  } catch (err) {
+    // Put the stock and the cart back so a failed attempt costs the user nothing.
+    await restoreStock(takenStock);
+    await Cart.updateOne({ user: req.user._id }, { $set: { items: cartItems } });
+    return next(err);
+  }
 };
 
 /**
- * @desc    Get user's order history
- * @route   GET /api/orders/my-orders
- * @access  Private
- *
- * Uses MongoDB Aggregation Pipeline for efficient data retrieval with pagination
+ * GET /api/orders/my-orders
+ * Order history for the logged-in user. One aggregation returns the page of orders
+ * and the total count together, so the list and its pagination cost a single trip.
  */
 const getMyOrders = async (req, res) => {
-  const { page = 1, limit = 10, status } = req.query;
-  const pageNum = parseInt(page);
-  const limitNum = parseInt(limit);
-  const skip = (pageNum - 1) * limitNum;
+  const { status } = req.query;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 10));
 
-  // ─── Aggregation Pipeline ─────────────────────────────────────────────────
-  const pipeline = [
-    // Stage 1: Filter by user
+  const [result] = await Order.aggregate([
     { $match: { user: req.user._id, ...(status && { status }) } },
-
-    // Stage 2: Sort newest first
     { $sort: { createdAt: -1 } },
-
-    // Stage 3: Facet for data + total count in one query
     {
       $facet: {
         orders: [
-          { $skip: skip },
-          { $limit: limitNum },
+          { $skip: (page - 1) * limit },
+          { $limit: limit },
           {
             $project: {
               orderNumber: 1, status: 1, pricing: 1, paymentMethod: 1,
@@ -126,30 +161,27 @@ const getMyOrders = async (req, res) => {
         totalCount: [{ $count: "count" }],
       },
     },
-  ];
+  ]);
 
-  const [result] = await Order.aggregate(pipeline);
-  const orders = result.orders;
   const totalItems = result.totalCount[0]?.count || 0;
-  const totalPages = Math.ceil(totalItems / limitNum);
 
-  return paginatedResponse(res, "Orders retrieved successfully", orders, {
-    page: pageNum, totalPages, totalItems, limit: limitNum,
+  return paginatedResponse(res, "Orders retrieved successfully", result.orders, {
+    page,
+    totalPages: Math.ceil(totalItems / limit),
+    totalItems,
+    limit,
   });
 };
 
 /**
- * @desc    Get single order details
- * @route   GET /api/orders/:id
- * @access  Private
+ * GET /api/orders/:id
  */
 const getOrderById = async (req, res, next) => {
   const order = await Order.findById(req.params.id).populate("user", "name email");
-
   if (!order) return next(createError("Order not found.", 404));
 
-  // Customers can only view their own orders
-  if (order.user._id.toString() !== req.user._id.toString() && req.user.role !== "admin") {
+  const isOwner = order.user._id.toString() === req.user._id.toString();
+  if (!isOwner && req.user.role !== "admin") {
     return next(createError("Access denied.", 403));
   }
 
@@ -157,93 +189,69 @@ const getOrderById = async (req, res, next) => {
 };
 
 /**
- * @desc    Cancel an order
- * @route   PUT /api/orders/:id/cancel
- * @access  Private
+ * PUT /api/orders/:id/cancel
  */
 const cancelOrder = async (req, res, next) => {
   const { reason } = req.body;
   const order = await Order.findById(req.params.id);
 
   if (!order) return next(createError("Order not found.", 404));
-
   if (order.user.toString() !== req.user._id.toString()) {
     return next(createError("Access denied.", 403));
   }
-
-  const cancellableStatuses = ["pending", "confirmed"];
-  if (!cancellableStatuses.includes(order.status)) {
-    return next(createError(`Cannot cancel an order with status: ${order.status}`, 400));
+  if (!CANCELLABLE.includes(order.status)) {
+    return next(createError(`An order that is already ${order.status} cannot be cancelled.`, 400));
   }
 
   order.status = "cancelled";
   order.cancelledAt = new Date();
   order.cancellationReason = reason || "Cancelled by customer";
-  order.statusHistory.push({ status: "cancelled", note: reason, updatedBy: req.user._id });
-
-  // Restore stock
-  await Promise.all(
-    order.items.map((item) =>
-      Product.findByIdAndUpdate(item.product, { $inc: { stock: item.quantity } })
-    )
-  );
+  order.statusHistory.push({
+    status: "cancelled",
+    note: order.cancellationReason,
+    updatedBy: req.user._id,
+  });
 
   await order.save();
+  await restoreStock(order.items);
 
   return successResponse(res, "Order cancelled successfully", { order });
 };
 
 /**
- * @desc    Admin: Get all orders with analytics
- * @route   GET /api/orders/admin/all
- * @access  Private/Admin
- *
- * Uses MongoDB Aggregation Pipeline for sales analytics
+ * GET /api/orders/admin/all
  */
 const getAllOrdersAdmin = async (req, res) => {
-  const { page = 1, limit = 20, status } = req.query;
-  const pageNum = parseInt(page);
-  const limitNum = parseInt(limit);
+  const { status, search } = req.query;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
 
-  const matchStage = status ? { status } : {};
+  const query = {
+    ...(status && { status }),
+    ...(search && { orderNumber: { $regex: search.trim(), $options: "i" } }),
+  };
 
-  const [ordersResult, analyticsResult] = await Promise.all([
-    // Paginated orders list
-    Order.find(matchStage)
+  const [orders, totalItems] = await Promise.all([
+    Order.find(query)
       .populate("user", "name email")
       .sort({ createdAt: -1 })
-      .skip((pageNum - 1) * limitNum)
-      .limit(limitNum),
-
-    // ─── Aggregation Pipeline: Sales Analytics ─────────────────────────────
-    Order.aggregate([
-      { $match: { status: { $nin: ["cancelled"] } } },
-      {
-        $group: {
-          _id: null,
-          totalRevenue: { $sum: "$pricing.grandTotal" },
-          totalOrders: { $sum: 1 },
-          avgOrderValue: { $avg: "$pricing.grandTotal" },
-          totalItems: { $sum: { $size: "$items" } },
-        },
-      },
-    ]),
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
+    Order.countDocuments(query),
   ]);
 
-  const totalItems = await Order.countDocuments(matchStage);
-
-  return paginatedResponse(
-    res,
-    "Orders retrieved",
-    { orders: ordersResult, analytics: analyticsResult[0] || {} },
-    { page: pageNum, totalPages: Math.ceil(totalItems / limitNum), totalItems, limit: limitNum }
-  );
+  return paginatedResponse(res, "Orders retrieved", orders, {
+    page,
+    totalPages: Math.ceil(totalItems / limit),
+    totalItems,
+    limit,
+  });
 };
 
 /**
- * @desc    Admin: Update order status
- * @route   PUT /api/orders/:id/status
- * @access  Private/Admin
+ * PUT /api/orders/:id/status
+ * Admins move an order along: pending -> confirmed -> shipped -> delivered.
  */
 const updateOrderStatus = async (req, res, next) => {
   const { status, note } = req.body;
@@ -251,17 +259,41 @@ const updateOrderStatus = async (req, res, next) => {
 
   if (!order) return next(createError("Order not found.", 404));
 
+  const allowed = NEXT_STATUS[order.status] || [];
+  if (!allowed.includes(status)) {
+    return next(
+      createError(
+        allowed.length
+          ? `An order that is ${order.status} can only move to: ${allowed.join(", ")}.`
+          : `An order that is ${order.status} cannot be updated any further.`,
+        400
+      )
+    );
+  }
+
   order.status = status;
-  order.statusHistory.push({ status, note: note || `Status updated to ${status}`, updatedBy: req.user._id });
+  order.statusHistory.push({
+    status,
+    note: note || `Marked as ${status}`,
+    updatedBy: req.user._id,
+  });
 
   if (status === "delivered") order.deliveredAt = new Date();
+  if (status === "cancelled") {
+    order.cancelledAt = new Date();
+    await restoreStock(order.items);
+  }
 
   await order.save();
 
-  return successResponse(res, "Order status updated", { order });
+  return successResponse(res, `Order marked as ${status}`, { order });
 };
 
 module.exports = {
-  placeOrder, getMyOrders, getOrderById, cancelOrder,
-  getAllOrdersAdmin, updateOrderStatus,
+  placeOrder,
+  getMyOrders,
+  getOrderById,
+  cancelOrder,
+  getAllOrdersAdmin,
+  updateOrderStatus,
 };

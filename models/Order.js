@@ -1,7 +1,6 @@
-/**
- * Order Model
- * Complete order with items snapshot, shipping, and payment details
- */
+// An order is a record of what was actually bought and paid. Items are stored as
+// copies rather than references, so changing a product's price tomorrow does not
+// rewrite what a customer paid today.
 
 const mongoose = require("mongoose");
 
@@ -38,8 +37,8 @@ const orderSchema = new mongoose.Schema(
     shippingAddress: shippingAddressSchema,
     paymentMethod: {
       type: String,
-      enum: ["razorpay", "cod"],
-      default: "razorpay",
+      enum: ["cod", "razorpay"],
+      default: "cod",
     },
     payment: {
       razorpay_order_id: String,
@@ -47,7 +46,7 @@ const orderSchema = new mongoose.Schema(
       razorpay_signature: String,
       status: {
         type: String,
-        enum: ["pending", "completed", "failed", "refunded"],
+        enum: ["pending", "completed", "failed"],
         default: "pending",
       },
       paidAt: Date,
@@ -61,7 +60,7 @@ const orderSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["pending", "confirmed", "processing", "shipped", "delivered", "cancelled", "refunded"],
+      enum: ["pending", "confirmed", "shipped", "delivered", "cancelled"],
       default: "pending",
     },
     statusHistory: [
@@ -80,8 +79,8 @@ const orderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// ─── Pre-save: Generate Order Number ─────────────────────────────────────────
-orderSchema.pre("save", async function (next) {
+// A short human-readable reference customers can quote, separate from the _id.
+orderSchema.pre("save", function (next) {
   if (!this.orderNumber) {
     const timestamp = Date.now().toString();
     const random = Math.floor(Math.random() * 1000).toString().padStart(3, "0");
@@ -90,10 +89,8 @@ orderSchema.pre("save", async function (next) {
   next();
 });
 
-// ─── Indexes ──────────────────────────────────────────────────────────────────
 orderSchema.index({ user: 1, createdAt: -1 });
 orderSchema.index({ status: 1 });
-orderSchema.index({ orderNumber: 1 });
 orderSchema.index({ "payment.razorpay_order_id": 1 });
 
 module.exports = mongoose.model("Order", orderSchema);

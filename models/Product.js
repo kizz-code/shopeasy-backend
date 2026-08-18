@@ -1,8 +1,3 @@
-/**
- * Product Model
- * Full product schema with ratings, stock, and category references
- */
-
 const mongoose = require("mongoose");
 const slugify = require("slugify");
 
@@ -11,7 +6,7 @@ const reviewSchema = new mongoose.Schema(
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     name: { type: String, required: true },
     rating: { type: Number, required: true, min: 1, max: 5 },
-    comment: { type: String, required: true },
+    comment: { type: String, required: true, maxlength: 500 },
   },
   { timestamps: true }
 );
@@ -43,9 +38,11 @@ const productSchema = new mongoose.Schema(
       required: [true, "Product price is required"],
       min: [0, "Price cannot be negative"],
     },
+    // 0 means "no offer running". Anything above 0 is what the customer actually pays.
     discountedPrice: {
       type: Number,
-      default: 0, // 0 means no discount
+      default: 0,
+      min: [0, "Discounted price cannot be negative"],
     },
     category: {
       type: mongoose.Schema.Types.ObjectId,
@@ -70,37 +67,13 @@ const productSchema = new mongoose.Schema(
       min: [0, "Stock cannot be negative"],
       default: 0,
     },
-    sku: {
-      type: String,
-      unique: true,
-      sparse: true, // Allows multiple null values
-    },
     tags: [{ type: String, lowercase: true, trim: true }],
-    isFeatured: {
-      type: Boolean,
-      default: false,
-    },
-    isActive: {
-      type: Boolean,
-      default: true,
-    },
+    isFeatured: { type: Boolean, default: false },
+    // Products are never hard-deleted, or old orders would lose what they refer to.
+    isActive: { type: Boolean, default: true },
     reviews: [reviewSchema],
-    rating: {
-      type: Number,
-      default: 0,
-      min: 0,
-      max: 5,
-    },
-    numReviews: {
-      type: Number,
-      default: 0,
-    },
-    weight: { type: Number, default: 0 }, // in grams
-    dimensions: {
-      length: Number,
-      width: Number,
-      height: Number,
-    },
+    rating: { type: Number, default: 0, min: 0, max: 5 },
+    numReviews: { type: Number, default: 0 },
   },
   {
     timestamps: true,
@@ -109,26 +82,23 @@ const productSchema = new mongoose.Schema(
   }
 );
 
-// ─── Indexes for Performance ──────────────────────────────────────────────────
-productSchema.index({ name: "text", description: "text", tags: "text" }); // Full-text search
-productSchema.index({ category: 1, price: 1 }); // Compound index for filtering
-productSchema.index({ isFeatured: 1, isActive: 1 });
-// productSchema.index({ slug: 1 });
+// The product list always filters on isActive and usually narrows by category or
+// price, so this one compound index covers the common browsing query.
+productSchema.index({ isActive: 1, category: 1, price: 1 });
+// Serves the homepage's featured strip.
+productSchema.index({ isActive: 1, isFeatured: 1 });
 
-// ─── Virtual: Discount Percentage ────────────────────────────────────────────
+productSchema.virtual("effectivePrice").get(function () {
+  return this.discountedPrice > 0 ? this.discountedPrice : this.price;
+});
+
 productSchema.virtual("discountPercentage").get(function () {
-  if (this.discountedPrice && this.discountedPrice < this.price) {
+  if (this.discountedPrice > 0 && this.discountedPrice < this.price) {
     return Math.round(((this.price - this.discountedPrice) / this.price) * 100);
   }
   return 0;
 });
 
-// ─── Virtual: Effective Price ─────────────────────────────────────────────────
-productSchema.virtual("effectivePrice").get(function () {
-  return this.discountedPrice > 0 ? this.discountedPrice : this.price;
-});
-
-// ─── Pre-save: Auto-generate Slug ────────────────────────────────────────────
 productSchema.pre("save", function (next) {
   if (this.isModified("name")) {
     this.slug = slugify(this.name, { lower: true, strict: true });
@@ -136,16 +106,15 @@ productSchema.pre("save", function (next) {
   next();
 });
 
-// ─── Method: Recalculate Rating ───────────────────────────────────────────────
 productSchema.methods.recalculateRating = function () {
   if (this.reviews.length === 0) {
     this.rating = 0;
     this.numReviews = 0;
-  } else {
-    const totalRating = this.reviews.reduce((sum, review) => sum + review.rating, 0);
-    this.rating = Math.round((totalRating / this.reviews.length) * 10) / 10;
-    this.numReviews = this.reviews.length;
+    return;
   }
+  const total = this.reviews.reduce((sum, r) => sum + r.rating, 0);
+  this.rating = Math.round((total / this.reviews.length) * 10) / 10;
+  this.numReviews = this.reviews.length;
 };
 
 module.exports = mongoose.model("Product", productSchema);

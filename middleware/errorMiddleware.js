@@ -1,11 +1,6 @@
-/**
- * Centralized Error Handling Middleware
- * Catches all errors and returns consistent JSON responses
- */
+const isProduction = () => process.env.NODE_ENV === "production";
 
-/**
- * notFound - 404 handler for unmatched routes
- */
+// Anything that did not match a route lands here and is turned into a normal error.
 const notFound = (req, res, next) => {
   const error = new Error(`Route not found: ${req.method} ${req.originalUrl}`);
   error.statusCode = 404;
@@ -13,64 +8,60 @@ const notFound = (req, res, next) => {
 };
 
 /**
- * errorHandler - Global error handler
- * Handles: Mongoose errors, JWT errors, custom errors, and generic errors
+ * The single place errors turn into responses. Controllers just call
+ * next(createError(...)) or throw, and this decides the status code and the body.
+ * Mongoose throws its own error shapes, so those are translated here too.
  */
 const errorHandler = (err, req, res, next) => {
-  let statusCode = err.statusCode || err.status || 500;
-  let message = err.message || "Internal Server Error";
+  let statusCode = err.statusCode || 500;
+  let message = err.message || "Something went wrong";
   let errors = err.errors || null;
 
-  // ─── Mongoose: Document Not Found ─────────────────────────────────────────
+  // Badly formed ObjectId in a URL
   if (err.name === "CastError") {
     statusCode = 400;
-    message = `Invalid ${err.path}: ${err.value}. Please provide a valid ID.`;
+    message = `Invalid ${err.path}: ${err.value}`;
   }
 
-  // ─── Mongoose: Duplicate Key Error ────────────────────────────────────────
+  // Unique index violation, e.g. registering an email that already exists
   if (err.code === 11000) {
-    statusCode = 409;
     const field = Object.keys(err.keyValue)[0];
-    const value = err.keyValue[field];
-    message = `${field.charAt(0).toUpperCase() + field.slice(1)} '${value}' already exists.`;
+    statusCode = 409;
+    message = `That ${field} is already taken.`;
   }
 
-  // ─── Mongoose: Validation Error ───────────────────────────────────────────
+  // Schema validation failed on save()
   if (err.name === "ValidationError") {
     statusCode = 422;
     message = "Validation failed";
-    errors = Object.values(err.errors).map((e) => ({
-      field: e.path,
-      message: e.message,
-    }));
+    errors = Object.values(err.errors).map((e) => ({ field: e.path, message: e.message }));
   }
 
-  // ─── JWT Errors ───────────────────────────────────────────────────────────
   if (err.name === "JsonWebTokenError") {
     statusCode = 401;
     message = "Invalid authentication token";
   }
-
   if (err.name === "TokenExpiredError") {
     statusCode = 401;
-    message = "Authentication token has expired";
+    message = "Your session has expired. Please log in again.";
   }
 
-  // ─── Log error in development ─────────────────────────────────────────────
-  if (process.env.NODE_ENV === "development") {
-    console.error("\n❌ Error:", {
-      message: err.message,
-      stack: err.stack,
-      statusCode,
-    });
+  if (!isProduction()) {
+    console.error(`[${statusCode}] ${req.method} ${req.originalUrl} - ${err.message}`);
+    if (statusCode === 500) console.error(err.stack);
   }
 
-  // ─── Send Response ────────────────────────────────────────────────────────
+  // An unexpected 500 can carry internal details in its message, so in production
+  // it is replaced with something generic. Errors we raised ourselves are fine.
+  if (isProduction() && statusCode === 500) {
+    message = "Something went wrong. Please try again.";
+  }
+
   res.status(statusCode).json({
     success: false,
     message,
     ...(errors && { errors }),
-    ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+    ...(!isProduction() && statusCode === 500 && { stack: err.stack }),
   });
 };
 

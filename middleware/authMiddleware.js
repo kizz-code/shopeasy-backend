@@ -1,104 +1,56 @@
-/**
- * Auth Middleware
- * JWT verification and role-based access control
- */
-
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const { createError } = require("../utils/apiError");
 
 /**
- * protect - Verifies JWT token and attaches user to request
- * Usage: router.get("/protected", protect, handler)
+ * Verifies the JWT and puts the user on req.user.
+ *
+ * The token itself carries the id and role, but we still load the user from the
+ * database on every request. That costs one lookup and buys correctness: a user
+ * who was deleted or deactivated after their token was issued is rejected straight
+ * away, instead of staying valid until the token expires.
+ *
+ *   router.get("/orders", protect, handler)
  */
 const protect = async (req, res, next) => {
-  let token;
+  const header = req.headers.authorization;
 
-  // Extract token from Authorization header (Bearer token)
-  if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
-    token = req.headers.authorization.split(" ")[1];
-  }
-
-  if (!token) {
-    return next(createError("Authentication required. Please login.", 401));
+  if (!header?.startsWith("Bearer ")) {
+    return next(createError("You need to be logged in to do that.", 401));
   }
 
   try {
-    // Verify token signature and expiry
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id);
 
-    // Fetch fresh user data (catches deleted/deactivated users)
-    const user = await User.findById(decoded.id).select("-password");
-
-    if (!user) {
-      return next(createError("User not found. Token invalid.", 401));
-    }
-
+    if (!user) return next(createError("That account no longer exists.", 401));
     if (!user.isActive) {
-      return next(createError("Your account has been deactivated. Contact support.", 403));
+      return next(createError("Your account has been deactivated. Please contact support.", 403));
     }
 
-    req.user = user; // Attach user to request object
+    req.user = user;
     next();
   } catch (error) {
-    if (error.name === "TokenExpiredError") {
-      return next(createError("Session expired. Please login again.", 401));
-    }
-    if (error.name === "JsonWebTokenError") {
-      return next(createError("Invalid token. Please login again.", 401));
-    }
-    return next(createError("Authentication failed.", 401));
+    // jwt.verify throws its own error types; the central error handler turns
+    // TokenExpiredError and JsonWebTokenError into the right 401 messages.
+    next(error);
   }
 };
 
 /**
- * authorize - Role-based access control
- * Usage: router.get("/admin", protect, authorize("admin"), handler)
- * @param {...string} roles - Allowed roles
+ * Restricts a route to certain roles. Always used after protect(), which is what
+ * sets req.user.
+ *
+ *   router.post("/products", protect, authorize("admin"), handler)
  */
-const authorize = (...roles) => {
-  return (req, res, next) => {
-    if (!req.user) {
-      return next(createError("Authentication required.", 401));
-    }
+const authorize = (...roles) => (req, res, next) => {
+  if (!req.user) return next(createError("You need to be logged in to do that.", 401));
 
-    if (!roles.includes(req.user.role)) {
-      return next(
-        createError(
-          `Access denied. Required role: ${roles.join(" or ")}. Your role: ${req.user.role}`,
-          403
-        )
-      );
-    }
-
-    next();
-  };
-};
-
-/**
- * optionalAuth - Attaches user if token provided, but doesn't fail if not
- * Useful for public routes that show different data for logged-in users
- */
-const optionalAuth = async (req, res, next) => {
-  let token;
-
-  if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
-    token = req.headers.authorization.split(" ")[1];
-  }
-
-  if (!token) return next(); // Continue without user
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id).select("-password");
-    if (user && user.isActive) {
-      req.user = user;
-    }
-  } catch {
-    // Silently fail - user just won't be attached
+  if (!roles.includes(req.user.role)) {
+    return next(createError("You do not have permission to do that.", 403));
   }
 
   next();
 };
 
-module.exports = { protect, authorize, optionalAuth };
+module.exports = { protect, authorize };

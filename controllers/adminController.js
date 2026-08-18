@@ -1,8 +1,3 @@
-/**
- * Admin Controller
- * Dashboard analytics, user management, product/order administration
- */
-
 const User = require("../models/User");
 const Product = require("../models/Product");
 const Order = require("../models/Order");
@@ -10,11 +5,10 @@ const { successResponse, paginatedResponse } = require("../utils/apiResponse");
 const { createError } = require("../utils/apiError");
 
 /**
- * @desc    Get admin dashboard overview
- * @route   GET /api/admin/dashboard
- * @access  Private/Admin
- *
- * Uses MongoDB Aggregation Pipelines for efficient analytics
+ * GET /api/admin/dashboard
+ * Every figure on the dashboard comes from an aggregation run in MongoDB rather
+ * than by pulling orders into Node and looping over them. They run in parallel,
+ * so the whole dashboard is one round of queries.
  */
 const getDashboard = async (req, res) => {
   const now = new Date();
@@ -35,7 +29,6 @@ const getDashboard = async (req, res) => {
     User.countDocuments({ role: "customer" }),
     Product.countDocuments({ isActive: true }),
 
-    // ─── Sales Analytics Aggregation ────────────────────────────────────────
     Order.aggregate([
       { $match: { status: { $nin: ["cancelled"] } } },
       {
@@ -81,7 +74,7 @@ const getDashboard = async (req, res) => {
       .limit(5)
       .lean(),
 
-    // ─── Top Selling Products Aggregation ───────────────────────────────────
+    // Best sellers: unwind each order into its items, then total by product.
     Order.aggregate([
       { $match: { status: { $nin: ["cancelled"] } } },
       { $unwind: "$items" },
@@ -98,7 +91,7 @@ const getDashboard = async (req, res) => {
       { $limit: 5 },
     ]),
 
-    // ─── Revenue Trend (last 7 days) Aggregation ─────────────────────────────
+    // Revenue per day, for the bar chart.
     Order.aggregate([
       { $match: { createdAt: { $gte: sevenDaysAgo }, status: { $nin: ["cancelled"] } } },
       {
@@ -113,7 +106,6 @@ const getDashboard = async (req, res) => {
       { $sort: { _id: 1 } },
     ]),
 
-    // ─── Orders by Status ────────────────────────────────────────────────────
     Order.aggregate([
       {
         $group: {
@@ -144,9 +136,7 @@ const getDashboard = async (req, res) => {
 };
 
 /**
- * @desc    Get all users (admin)
- * @route   GET /api/admin/users
- * @access  Private/Admin
+ * GET /api/admin/users
  */
 const getAllUsers = async (req, res) => {
   const { page = 1, limit = 20, search, role } = req.query;
@@ -178,9 +168,9 @@ const getAllUsers = async (req, res) => {
 };
 
 /**
- * @desc    Toggle user active status
- * @route   PUT /api/admin/users/:id/toggle-status
- * @access  Private/Admin
+ * PUT /api/admin/users/:id/toggle-status
+ * Deactivating takes effect immediately: protect() re-reads isActive on every
+ * request, so the user's existing token stops working straight away.
  */
 const toggleUserStatus = async (req, res, next) => {
   const user = await User.findById(req.params.id);

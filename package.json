@@ -1,12 +1,14 @@
 {
   "name": "shopeasy-backend",
   "version": "1.0.0",
-  "description": "ShopEasy E-Commerce Backend API",
+  "description": "ShopEasy e-commerce REST API (Express + MongoDB)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "seed": "node utils/seeder.js"
+    "seed": "node utils/seeder.js",
+    "test:e2e": "node tests/e2e.js",
+    "test:routes": "node tests/route-map.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

@@ -1,158 +1,144 @@
-/**
- * Product Controller
- * CRUD, search, filter, pagination, and reviews
- */
-
 const Product = require("../models/Product");
 const { createError } = require("../utils/apiError");
 const { successResponse, paginatedResponse } = require("../utils/apiResponse");
 
-/**
- * @desc    Get all products with search, filter, sort, pagination
- * @route   GET /api/products
- * @access  Public
- */
-const getProducts = async (req, res) => {
-  const {
-    search,
-    category,
-    minPrice,
-    maxPrice,
-    brand,
-    featured,
-    sort = "-createdAt",
-    page = 1,
-    limit = 12,
-  } = req.query;
+// Only these sorts are accepted, so a query string cannot ask Mongo to sort by
+// anything we did not intend.
+const SORT_OPTIONS = {
+  newest: { createdAt: -1 },
+  "price-asc": { price: 1 },
+  "price-desc": { price: -1 },
+  rating: { rating: -1 },
+  name: { name: 1 },
+};
 
-  // ─── Build Query Object ────────────────────────────────────────────────────
+// Escapes user input before it goes into a regex, so a stray "(" or "*" is treated
+// as a plain character instead of blowing up the query.
+const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const buildProductQuery = ({ search, category, minPrice, maxPrice, brand, featured }) => {
   const query = { isActive: true };
 
-  // Full-text search
-  if (search) {
-    query.$text = { $search: search };
+  if (search?.trim()) {
+    const term = new RegExp(escapeRegex(search.trim()), "i");
+    query.$or = [{ name: term }, { brand: term }, { tags: term }];
   }
 
-  // Category filter
-  if (category) {
-    query.category = category;
-  }
+  if (category) query.category = category;
+  if (brand) query.brand = new RegExp(`^${escapeRegex(brand)}$`, "i");
+  if (featured === "true") query.isFeatured = true;
 
-  // Price range filter
   if (minPrice || maxPrice) {
     query.price = {};
     if (minPrice) query.price.$gte = Number(minPrice);
     if (maxPrice) query.price.$lte = Number(maxPrice);
   }
 
-  // Brand filter
-  if (brand) {
-    query.brand = { $regex: brand, $options: "i" };
-  }
+  return query;
+};
 
-  // Featured filter
-  if (featured === "true") {
-    query.isFeatured = true;
-  }
+/**
+ * GET /api/products
+ * Search, filter, sort and pagination all happen in MongoDB. The browser only ever
+ * receives the page it asked for, which keeps the response small no matter how big
+ * the catalogue grows.
+ */
+const getProducts = async (req, res) => {
+  const { sort = "newest" } = req.query;
 
-  // ─── Pagination ────────────────────────────────────────────────────────────
-  const pageNum = Math.max(1, parseInt(page));
-  const limitNum = Math.min(50, Math.max(1, parseInt(limit)));
-  const skip = (pageNum - 1) * limitNum;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 12));
+  const query = buildProductQuery(req.query);
 
-  // ─── Execute Query ─────────────────────────────────────────────────────────
   const [products, totalItems] = await Promise.all([
     Product.find(query)
+      .select("-reviews")
       .populate("category", "name slug")
-      .sort(sort)
-      .skip(skip)
-      .limit(limitNum)
+      .sort(SORT_OPTIONS[sort] || SORT_OPTIONS.newest)
+      .skip((page - 1) * limit)
+      .limit(limit)
       .lean(),
     Product.countDocuments(query),
   ]);
 
-  const totalPages = Math.ceil(totalItems / limitNum);
-
   return paginatedResponse(res, "Products retrieved successfully", products, {
-    page: pageNum,
-    totalPages,
+    page,
+    totalPages: Math.ceil(totalItems / limit),
     totalItems,
-    limit: limitNum,
+    limit,
   });
 };
 
 /**
- * @desc    Get single product by ID or slug
- * @route   GET /api/products/:identifier
- * @access  Public
+ * GET /api/products/:identifier
+ * Accepts either a Mongo id or a slug, so /products/apple-iphone-15-pro works
+ * as well as /products/6a29...
  */
 const getProduct = async (req, res, next) => {
   const { identifier } = req.params;
-
-  // Try by ID first, then by slug
   const isObjectId = /^[a-fA-F0-9]{24}$/.test(identifier);
-  const query = isObjectId ? { _id: identifier } : { slug: identifier };
 
-  const product = await Product.findOne({ ...query, isActive: true }).populate(
-    "category",
-    "name slug"
-  );
+  const product = await Product.findOne({
+    ...(isObjectId ? { _id: identifier } : { slug: identifier }),
+    isActive: true,
+  }).populate("category", "name slug");
 
-  if (!product) {
-    return next(createError("Product not found.", 404));
-  }
+  if (!product) return next(createError("Product not found.", 404));
 
   return successResponse(res, "Product retrieved successfully", { product });
 };
 
 /**
- * @desc    Create new product
- * @route   POST /api/products
- * @access  Private/Admin
+ * GET /api/products/featured
+ */
+const getFeaturedProducts = async (req, res) => {
+  const products = await Product.find({ isFeatured: true, isActive: true })
+    .select("-reviews")
+    .populate("category", "name slug")
+    .limit(8)
+    .lean();
+
+  return successResponse(res, "Featured products retrieved", { products });
+};
+
+const EDITABLE_FIELDS = [
+  "name", "description", "shortDescription", "price", "discountedPrice",
+  "category", "brand", "images", "stock", "tags", "isFeatured", "isActive",
+];
+
+/**
+ * POST /api/products  (admin)
  */
 const createProduct = async (req, res, next) => {
-  const {
-    name, description, shortDescription, price, discountedPrice,
-    category, brand, images, stock, sku, tags, isFeatured, weight, dimensions,
-  } = req.body;
-
-  // Check for duplicate SKU
-  if (sku) {
-    const existing = await Product.findOne({ sku });
-    if (existing) return next(createError("A product with this SKU already exists.", 409));
-  }
-
-  const product = await Product.create({
-    name, description, shortDescription, price, discountedPrice,
-    category, brand, images, stock, sku, tags, isFeatured, weight, dimensions,
+  const payload = {};
+  EDITABLE_FIELDS.forEach((field) => {
+    if (req.body[field] !== undefined) payload[field] = req.body[field];
   });
 
+  if (payload.discountedPrice > 0 && payload.discountedPrice >= payload.price) {
+    return next(createError("Discounted price must be lower than the actual price.", 400));
+  }
+
+  const product = await Product.create(payload);
   await product.populate("category", "name slug");
 
   return successResponse(res, "Product created successfully", { product }, 201);
 };
 
 /**
- * @desc    Update product
- * @route   PUT /api/products/:id
- * @access  Private/Admin
+ * PUT /api/products/:id  (admin)
  */
 const updateProduct = async (req, res, next) => {
   const product = await Product.findById(req.params.id);
   if (!product) return next(createError("Product not found.", 404));
 
-  // Update only provided fields
-  const allowedFields = [
-    "name", "description", "shortDescription", "price", "discountedPrice",
-    "category", "brand", "images", "stock", "sku", "tags", "isFeatured",
-    "isActive", "weight", "dimensions",
-  ];
-
-  allowedFields.forEach((field) => {
-    if (req.body[field] !== undefined) {
-      product[field] = req.body[field];
-    }
+  EDITABLE_FIELDS.forEach((field) => {
+    if (req.body[field] !== undefined) product[field] = req.body[field];
   });
+
+  if (product.discountedPrice > 0 && product.discountedPrice >= product.price) {
+    return next(createError("Discounted price must be lower than the actual price.", 400));
+  }
 
   await product.save();
   await product.populate("category", "name slug");
@@ -161,38 +147,21 @@ const updateProduct = async (req, res, next) => {
 };
 
 /**
- * @desc    Delete product (soft delete)
- * @route   DELETE /api/products/:id
- * @access  Private/Admin
+ * DELETE /api/products/:id  (admin)
+ * Soft delete - past orders still need to be able to show what was bought.
  */
 const deleteProduct = async (req, res, next) => {
   const product = await Product.findById(req.params.id);
   if (!product) return next(createError("Product not found.", 404));
 
-  product.isActive = false; // Soft delete preserves order history
+  product.isActive = false;
   await product.save();
 
   return successResponse(res, "Product deleted successfully");
 };
 
 /**
- * @desc    Get featured products
- * @route   GET /api/products/featured
- * @access  Public
- */
-const getFeaturedProducts = async (req, res) => {
-  const products = await Product.find({ isFeatured: true, isActive: true })
-    .populate("category", "name slug")
-    .limit(8)
-    .lean();
-
-  return successResponse(res, "Featured products retrieved", { products });
-};
-
-/**
- * @desc    Add product review
- * @route   POST /api/products/:id/reviews
- * @access  Private
+ * POST /api/products/:id/reviews
  */
 const addReview = async (req, res, next) => {
   const { rating, comment } = req.body;
@@ -200,13 +169,11 @@ const addReview = async (req, res, next) => {
 
   if (!product) return next(createError("Product not found.", 404));
 
-  // Check if user already reviewed
-  const alreadyReviewed = product.reviews.find(
+  const alreadyReviewed = product.reviews.some(
     (r) => r.user.toString() === req.user._id.toString()
   );
-
   if (alreadyReviewed) {
-    return next(createError("You have already reviewed this product.", 400));
+    return next(createError("You have already reviewed this product.", 409));
   }
 
   product.reviews.push({
@@ -215,14 +182,23 @@ const addReview = async (req, res, next) => {
     rating: Number(rating),
     comment,
   });
-
   product.recalculateRating();
   await product.save();
 
-  return successResponse(res, "Review added successfully", { rating: product.rating }, 201);
+  return successResponse(
+    res,
+    "Review added successfully",
+    { rating: product.rating, numReviews: product.numReviews },
+    201
+  );
 };
 
 module.exports = {
-  getProducts, getProduct, createProduct, updateProduct,
-  deleteProduct, getFeaturedProducts, addReview,
+  getProducts,
+  getProduct,
+  getFeaturedProducts,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  addReview,
 };

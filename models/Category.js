@@ -1,8 +1,3 @@
-/**
- * Category Model
- * Product categories with slug-based lookup
- */
-
 const mongoose = require("mongoose");
 const slugify = require("slugify");
 

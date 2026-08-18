@@ -1,14 +1,18 @@
-// cartRoutes.js
 const express = require("express");
-const cartRouter = express.Router();
+const router = express.Router();
 const { protect } = require("../middleware/authMiddleware");
-const { getCart, addToCart, updateCartItem, removeFromCart, clearCart } = require("../controllers/cartController");
+const validate = require("../middleware/validate");
+const { cartAddRules, cartUpdateRules, mongoIdParam } = require("../middleware/validators");
+const {
+  getCart, addToCart, updateCartItem, removeFromCart, clearCart,
+} = require("../controllers/cartController");
 
-cartRouter.use(protect); // All cart routes require authentication
-cartRouter.get("/", getCart);
-cartRouter.post("/add", addToCart);
-cartRouter.put("/update", updateCartItem);
-cartRouter.delete("/remove/:productId", removeFromCart);
-cartRouter.delete("/clear", clearCart);
+router.use(protect); // there is no such thing as a guest cart here
 
-module.exports = cartRouter;
+router.get("/", getCart);
+router.post("/add", cartAddRules, validate, addToCart);
+router.put("/update", cartUpdateRules, validate, updateCartItem);
+router.delete("/clear", clearCart);
+router.delete("/remove/:productId", mongoIdParam("productId"), validate, removeFromCart);
+
+module.exports = router;

@@ -1,7 +1,5 @@
-/**
- * Cart Model
- * Persistent cart linked to user with denormalized product data
- */
+// One cart per user, stored server-side rather than in localStorage so it follows
+// the user between devices and cannot be edited from the browser console.
 
 const mongoose = require("mongoose");
 
@@ -17,7 +15,8 @@ const cartItemSchema = new mongoose.Schema({
     min: [1, "Quantity must be at least 1"],
     default: 1,
   },
-  // Denormalized snapshot at time of adding to cart
+  // Copied in when the item is added, so the cart still renders even if the
+  // product is later removed. The live price is read from the product on read.
   price: { type: Number, required: true },
   name: { type: String, required: true },
   image: { type: String, default: "" },
@@ -40,12 +39,12 @@ const cartSchema = new mongoose.Schema(
   }
 );
 
-// ─── Virtual: Total Items Count ───────────────────────────────────────────────
+// Virtual: Total Items Count
 cartSchema.virtual("totalItems").get(function () {
   return this.items.reduce((sum, item) => sum + item.quantity, 0);
 });
 
-// ─── Virtual: Total Price ─────────────────────────────────────────────────────
+// Virtual: Total Price
 cartSchema.virtual("totalPrice").get(function () {
   return this.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
 });
